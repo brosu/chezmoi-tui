@@ -324,26 +324,40 @@ fn kill_command_tree(child: &mut std::process::Child) {
     let _ = child.kill();
 }
 
-fn collect_ignore_files(source_dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut directories = vec![source_dir.to_path_buf()];
+fn collect_ignore_files(
+    source_dir: &Path,
+    active_directories: Vec<PathBuf>,
+) -> Result<Vec<PathBuf>> {
+    let directories: BTreeSet<_> = active_directories
+        .into_iter()
+        .chain(std::iter::once(source_dir.to_path_buf()))
+        .collect();
     let mut files = Vec::new();
-    while let Some(directory) = directories.pop() {
-        let entries = match std::fs::read_dir(&directory) {
-            Ok(entries) => entries,
-            Err(err) if directory == source_dir && err.kind() == std::io::ErrorKind::NotFound => {
-                continue;
-            }
-            Err(err) => {
-                return Err(err).with_context(|| format!("failed to read {}", directory.display()));
-            }
+    for directory in directories {
+        if !directory.starts_with(source_dir) {
+            bail!(
+                "managed source directory is outside source root: {}",
+                directory.display()
+            );
+        }
+        let metadata = if directory == source_dir {
+            std::fs::metadata(&directory)
+        } else {
+            std::fs::symlink_metadata(&directory)
         };
-        for entry in entries {
-            let entry = entry?;
-            let name = entry.file_name();
-            if name == ".chezmoiignore" || name == ".chezmoiignore.tmpl" {
-                files.push(entry.path());
-            } else if !name.to_string_lossy().starts_with('.') && entry.file_type()?.is_dir() {
-                directories.push(entry.path());
+        match metadata {
+            Ok(metadata) if metadata.file_type().is_dir() => {}
+            Ok(_) => continue,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("failed to inspect {}", directory.display()));
+            }
+        }
+        for name in [".chezmoiignore", ".chezmoiignore.tmpl"] {
+            let path = directory.join(name);
+            if path.try_exists()? {
+                files.push(path);
             }
         }
     }
@@ -408,8 +422,22 @@ impl ChezmoiClient for ShellChezmoiClient {
 
     fn ignore_patterns(&self) -> Result<Vec<String>> {
         let source_dir = self.source_dir()?;
+        // Let chezmoi decide which source directories are active. A raw walk
+        // would render templates under ignored or external subtrees that
+        // chezmoi deliberately skips, disabling otherwise-valid filtering.
+        let result = self.run_raw(
+            [
+                "managed",
+                "--include=dirs",
+                "--exclude=externals",
+                "--path-style=source-absolute",
+            ],
+            &self.home_dir,
+        )?;
+        ensure_complete_success(&result, "chezmoi managed source directories")?;
+        let active_directories = parse_managed_output(&result.stdout);
         let mut patterns = Vec::new();
-        for ignore_file in collect_ignore_files(&source_dir)? {
+        for ignore_file in collect_ignore_files(&source_dir, active_directories)? {
             let template = std::fs::read_to_string(&ignore_file)
                 .with_context(|| format!("failed to read {}", ignore_file.display()))?;
             let rendered = self.execute_template(&template)?;

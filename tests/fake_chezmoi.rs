@@ -71,7 +71,19 @@ case "$cmd" in
     printf ' M .zshrc\n'
     ;;
   managed)
-    printf '[".zshrc",".config/nvim/init.lua"]\n'
+    case " $* " in
+      *" --path-style=source-absolute "*)
+        if [ -f "$source_dir/.active-source-dirs" ]; then
+          cat "$source_dir/.active-source-dirs"
+        else
+          for directory in "$source_dir"/*/; do
+            [ -d "$directory" ] && [ ! -L "${{directory%/}}" ] || continue
+            printf '%s\n' "${{directory%/}}"
+          done
+        fi
+        ;;
+      *) printf '[".zshrc",".config/nvim/init.lua"]\n' ;;
+    esac
     ;;
   unmanaged)
     printf 'tmp.txt\n'
@@ -185,6 +197,31 @@ impl FakeChezmoi {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[test]
+fn shell_client_does_not_render_ignored_source_subtrees() {
+    let fake = FakeChezmoi::new();
+    let ignored = fake.source.join("Foo");
+    fs::create_dir(&ignored).expect("ignored source directory");
+    fs::write(fake.source.join(".chezmoiignore"), "Foo\nBar/secret\n").expect("root ignore");
+    fs::write(ignored.join(".chezmoiignore"), "BAD_TEMPLATE\n").expect("inactive template");
+    fs::write(fake.source.join(".active-source-dirs"), "")
+        .expect("chezmoi reports no active source directories");
+    let script = fs::read_to_string(&fake.bin).expect("read fake");
+    fs::write(
+        &fake.bin,
+        script.replace(
+            "    cat\n",
+            "    template=$(cat)\n    case \"$template\" in\n      *BAD_TEMPLATE*) printf 'inactive template must not execute' >&2; exit 7 ;;\n      *) printf '%s\\n' \"$template\" ;;\n    esac\n",
+        ),
+    )
+    .expect("configure renderer");
+
+    assert_eq!(
+        fake.client().ignore_patterns().expect("valid active rules"),
+        vec!["Foo", "Bar/secret"]
+    );
+}
 
 #[test]
 fn shell_client_loads_ignore_template_suffix() {

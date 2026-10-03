@@ -10,7 +10,8 @@ It includes the original fix from [PR #23](https://github.com/tetsuya-dev-jp/che
 - Re-apply rendered ignore rules during unmanaged tree descent and filtering.
 - Support zero-directory globstars, character classes, alternatives, escaped literals, and inline comments.
 - Preserve chezmoi's order-independent negation precedence and keep re-included files reachable.
-- Read `.chezmoiignore.tmpl` as well as `.chezmoiignore`.
+- Read `.chezmoiignore.tmpl` as well as `.chezmoiignore`, including active nested source directories.
+- Skip ignore templates inside source subtrees that chezmoi ignores or treats as external.
 - Bound template execution with the existing timeout and output limits.
 - Warn when ignore filtering is unavailable or patterns are invalid, without discarding the other refreshed lists.
 
