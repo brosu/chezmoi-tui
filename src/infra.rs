@@ -61,6 +61,20 @@ impl ShellChezmoiClient {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
+        self.run_raw_with_input(args, destination_dir, None, CommandLimits::default())
+    }
+
+    fn run_raw_with_input<I, S>(
+        &self,
+        args: I,
+        destination_dir: &Path,
+        input: Option<&str>,
+        limits: CommandLimits,
+    ) -> Result<CommandResult>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
         let args: Vec<OsString> = args
             .into_iter()
             .map(|arg| arg.as_ref().to_os_string())
@@ -72,15 +86,18 @@ impl ShellChezmoiClient {
         }
         cmd.args(&args);
 
-        let result = run_command_with_limits(
-            cmd,
-            &args,
-            CommandLimits {
-                timeout: DEFAULT_COMMAND_TIMEOUT,
-                max_stdout_bytes: DEFAULT_MAX_STDOUT_BYTES,
-                max_stderr_bytes: DEFAULT_MAX_STDERR_BYTES,
-            },
-        )?;
+        if let Some(input) = input {
+            // Prepare stdin before spawning so writes cannot block on a child that
+            // is producing output or leave a running child behind on write errors.
+            let mut stdin = tempfile::tempfile().context("failed to create stdin temp file")?;
+            stdin
+                .write_all(input.as_bytes())
+                .context("failed to write template stdin")?;
+            stdin.seek(SeekFrom::Start(0))?;
+            cmd.stdin(Stdio::from(stdin));
+        }
+
+        let result = run_command_with_limits(cmd, &args, limits)?;
 
         tracing::info!(
             binary = %self.binary,
@@ -126,6 +143,16 @@ struct CommandLimits {
     max_stderr_bytes: usize,
 }
 
+impl Default for CommandLimits {
+    fn default() -> Self {
+        Self {
+            timeout: DEFAULT_COMMAND_TIMEOUT,
+            max_stdout_bytes: DEFAULT_MAX_STDOUT_BYTES,
+            max_stderr_bytes: DEFAULT_MAX_STDERR_BYTES,
+        }
+    }
+}
+
 struct LimitedText {
     text: String,
     truncated: bool,
@@ -155,8 +182,7 @@ fn read_temp_file_limited(mut file: File, max_bytes: usize) -> Result<LimitedTex
 
     if truncated {
         text.push_str(&format!(
-            "\n--- output truncated at {} bytes ---\n",
-            max_bytes
+            "\n--- output truncated at {max_bytes} bytes ---\n"
         ));
     }
 
@@ -180,11 +206,19 @@ fn run_command_with_limits(
 
     let started = Instant::now();
 
+    // Keep template subprocesses in their own group so a limit also stops
+    // commands launched by template functions, not just the renderer itself.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+
     let mut child = cmd
         .stdout(Stdio::from(stdout_for_child))
         .stderr(Stdio::from(stderr_for_child))
         .spawn()
-        .with_context(|| format!("failed to spawn command {:?}", args_for_log))?;
+        .with_context(|| format!("failed to spawn command {args_for_log:?}"))?;
 
     let deadline = started + limits.timeout;
     let mut timed_out = false;
@@ -197,7 +231,7 @@ fn run_command_with_limits(
             || stderr_len > limits.max_stderr_bytes as u64
         {
             output_limited = true;
-            let _ = child.kill();
+            kill_command_tree(&mut child);
             let status = child
                 .wait()
                 .with_context(|| "failed to wait after output limit kill")?;
@@ -243,7 +277,7 @@ fn run_command_with_limits(
 
         if Instant::now() >= deadline {
             timed_out = true;
-            let _ = child.kill();
+            kill_command_tree(&mut child);
             let status = child
                 .wait()
                 .with_context(|| "failed to wait after killing child")?;
@@ -270,6 +304,52 @@ fn run_command_with_limits(
 
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+fn kill_command_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        unsafe extern "C" {
+            fn kill(pid: std::os::raw::c_int, signal: std::os::raw::c_int) -> std::os::raw::c_int;
+        }
+        if let Ok(pid) = i32::try_from(child.id()) {
+            // SAFETY: the child was spawned in its own POSIX process group,
+            // negative pid targets that group, and SIGKILL is 9 on POSIX systems.
+            unsafe {
+                kill(-pid, 9);
+            }
+        }
+    }
+    // Also handles non-Unix platforms and a group kill that failed.
+    let _ = child.kill();
+}
+
+fn collect_ignore_files(source_dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut directories = vec![source_dir.to_path_buf()];
+    let mut files = Vec::new();
+    while let Some(directory) = directories.pop() {
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(err) if directory == source_dir && err.kind() == std::io::ErrorKind::NotFound => {
+                continue;
+            }
+            Err(err) => {
+                return Err(err).with_context(|| format!("failed to read {}", directory.display()));
+            }
+        };
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            if name == ".chezmoiignore" || name == ".chezmoiignore.tmpl" {
+                files.push(entry.path());
+            } else if !name.to_string_lossy().starts_with('.') && entry.file_type()?.is_dir() {
+                directories.push(entry.path());
+            }
+        }
+    }
+    // Both names are loaded by chezmoi, not one selected in preference to the other.
+    files.sort();
+    Ok(files)
 }
 
 fn ensure_complete_success(result: &CommandResult, command: &str) -> Result<()> {
@@ -328,18 +408,48 @@ impl ChezmoiClient for ShellChezmoiClient {
 
     fn ignore_patterns(&self) -> Result<Vec<String>> {
         let source_dir = self.source_dir()?;
-        let ignore_file = source_dir.join(".chezmoiignore");
-        let template = match std::fs::read_to_string(&ignore_file) {
-            Ok(content) => content,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(err) => {
-                return Err(err)
-                    .with_context(|| format!("failed to read {}", ignore_file.display()));
+        let mut patterns = Vec::new();
+        for ignore_file in collect_ignore_files(&source_dir)? {
+            let template = std::fs::read_to_string(&ignore_file)
+                .with_context(|| format!("failed to read {}", ignore_file.display()))?;
+            let rendered = self.execute_template(&template)?;
+            let parent = ignore_file.parent().context("ignore file has no parent")?;
+            if parent == source_dir {
+                patterns.extend(rendered.lines().map(str::to_owned));
+                continue;
             }
-        };
 
-        let rendered = self.execute_template(&template)?;
-        Ok(rendered.lines().map(str::to_owned).collect())
+            // Ask chezmoi to decode source attributes instead of maintaining a
+            // second decoder for private_, exact_, dot_, literal_, etc.
+            let result = self.run_raw(
+                [
+                    OsStr::new("target-path"),
+                    OsStr::new("--"),
+                    parent.as_os_str(),
+                ],
+                &self.home_dir,
+            )?;
+            ensure_complete_success(&result, "chezmoi target-path")?;
+            let target = PathBuf::from(result.stdout.trim());
+            let relative = target.strip_prefix(&self.home_dir).with_context(|| {
+                format!(
+                    "ignore file target {} is outside destination",
+                    target.display()
+                )
+            })?;
+            let prefix = relative.to_string_lossy().replace('\\', "/");
+            for line in rendered.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    patterns.push(line.to_owned());
+                } else if let Some(pattern) = line.strip_prefix('!') {
+                    patterns.push(format!("!{prefix}/{pattern}"));
+                } else {
+                    patterns.push(format!("{prefix}/{line}"));
+                }
+            }
+        }
+        Ok(patterns)
     }
 
     fn source(&self) -> Result<(PathBuf, Vec<PathBuf>)> {
@@ -372,10 +482,8 @@ impl ChezmoiClient for ShellChezmoiClient {
 
 impl ShellChezmoiClient {
     fn source_dir(&self) -> Result<PathBuf> {
-        if let Some(source_dir) = &self.source_dir {
-            return Ok(source_dir.clone());
-        }
-
+        // --source is a working tree, not necessarily the effective source root
+        // when .chezmoiroot is present. Let chezmoi resolve it in both cases.
         let result = self.run_raw(["source-path"], &self.home_dir)?;
         ensure_complete_success(&result, "chezmoi source-path")?;
         let source_dir = result.stdout.trim();
@@ -385,39 +493,16 @@ impl ShellChezmoiClient {
         Ok(PathBuf::from(source_dir))
     }
 
-    /// Render a chezmoi template (e.g. the contents of `.chezmoiignore`) by
-    /// piping it through `chezmoi execute-template` on stdin.
+    /// Render an ignore template through the same bounded runner as other commands.
     fn execute_template(&self, template: &str) -> Result<String> {
-        let mut cmd = Command::new(&self.binary);
-        cmd.arg("--destination").arg(&self.home_dir);
-        if let Some(source_dir) = &self.source_dir {
-            cmd.arg("--source").arg(source_dir);
-        }
-        cmd.arg("execute-template")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        let mut child = cmd
-            .spawn()
-            .context("failed to spawn chezmoi execute-template")?;
-        child
-            .stdin
-            .take()
-            .context("failed to open chezmoi execute-template stdin")?
-            .write_all(template.as_bytes())
-            .context("failed to write template to chezmoi execute-template")?;
-
-        let output = child
-            .wait_with_output()
-            .context("failed to run chezmoi execute-template")?;
-        if !output.status.success() {
-            bail!(
-                "chezmoi execute-template failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        let result = self.run_raw_with_input(
+            ["execute-template"],
+            &self.home_dir,
+            Some(template),
+            CommandLimits::default(),
+        )?;
+        ensure_complete_success(&result, "chezmoi execute-template")?;
+        Ok(result.stdout)
     }
 
     fn expand_working_root_entries_from_home(&self, scoped: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
@@ -1013,6 +1098,182 @@ printf ' A .zshrc\n'
 
         assert!(result.truncated);
         assert!(result.text.contains("output truncated"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn template_output_limit_terminates_children_and_reaps_renderer() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let binary = temp.path().join("fake-chezmoi");
+        let pids = temp.path().join("pids");
+        let script = format!(
+            "#!/bin/sh\nsleep 30 &\nprintf '%s %s' \"$$\" \"$!\" > '{}'\nprintf 'excess output'\nwait\n",
+            pids.display()
+        );
+        std::fs::write(&binary, script).expect("write renderer");
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
+            .expect("make executable");
+        let client = ShellChezmoiClient::new(
+            binary.to_str().expect("binary path").to_owned(),
+            temp.path().to_path_buf(),
+            temp.path().to_path_buf(),
+            Some(temp.path().to_path_buf()),
+        );
+        let result = client
+            .run_raw_with_input(
+                ["execute-template"],
+                temp.path(),
+                Some("template input"),
+                CommandLimits {
+                    timeout: Duration::from_secs(1),
+                    max_stdout_bytes: 4,
+                    max_stderr_bytes: 64,
+                },
+            )
+            .expect("bounded renderer");
+        let ids = std::fs::read_to_string(pids).expect("renderer PIDs");
+        let ids: Vec<_> = ids.split_whitespace().collect();
+        let renderer_reaped = !PathBuf::from(format!("/proc/{}", ids[0])).exists();
+        // SIGKILL delivery to descendants is asynchronous; the renderer wait
+        // reaps only the direct child, so allow the worker time to stop.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let worker_stopped = loop {
+            let state = std::fs::read_to_string(format!("/proc/{}/stat", ids[1]));
+            let stopped = match state {
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::NotFound
+                        // Linux procfs can report ESRCH when a process exits
+                        // between opening its stat file and reading it.
+                        || err.raw_os_error() == Some(3) =>
+                {
+                    true
+                }
+                Ok(stat) => stat
+                    .rsplit_once(") ")
+                    .is_some_and(|(_, rest)| rest.starts_with('Z') || rest.starts_with('X')),
+                Err(err) => panic!("cannot inspect renderer child: {err}"),
+            };
+            if stopped || Instant::now() >= deadline {
+                break stopped;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        // Clean up the fixture even when the regression is present.
+        if !worker_stopped {
+            let _ = Command::new("kill").args(["-KILL", ids[1]]).output();
+        }
+
+        assert!(result.output_limited);
+        assert!(renderer_reaped, "renderer was not reaped");
+        assert!(worker_stopped, "renderer child still running");
+    }
+
+    #[cfg(unix)]
+    fn template_test_client(temp: &tempfile::TempDir, script: &str) -> ShellChezmoiClient {
+        use std::os::unix::fs::PermissionsExt;
+
+        let binary = temp.path().join("template-renderer");
+        std::fs::write(&binary, format!("#!/bin/sh\n{script}\n")).expect("write renderer");
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
+            .expect("make renderer executable");
+        ShellChezmoiClient::new(
+            binary.to_string_lossy(),
+            temp.path().to_path_buf(),
+            temp.path().to_path_buf(),
+            None,
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn template_stdin_that_is_never_read_still_times_out() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pid_file = temp.path().join("renderer.pid");
+        let client = template_test_client(
+            &temp,
+            &format!(
+                "printf '%s' \"$$\" > '{}'\nexec sleep 30",
+                pid_file.display()
+            ),
+        );
+        let started = Instant::now();
+        let result = client
+            .run_raw_with_input(
+                ["execute-template"],
+                temp.path(),
+                Some(&"x".repeat(512 * 1024)),
+                CommandLimits {
+                    timeout: Duration::from_millis(100),
+                    max_stdout_bytes: 64,
+                    max_stderr_bytes: 64,
+                },
+            )
+            .expect("bounded renderer");
+
+        assert!(result.timed_out);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(
+            ensure_complete_success(&result, "chezmoi execute-template")
+                .expect_err("timeout must propagate")
+                .to_string()
+                .contains("timed out")
+        );
+        let pid = std::fs::read_to_string(pid_file).expect("renderer PID");
+        let alive = Command::new("kill")
+            .args(["-0", &pid])
+            .output()
+            .expect("check PID");
+        assert!(!alive.status.success(), "renderer not reaped");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn template_can_write_large_output_before_reading_large_stdin() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let client =
+            template_test_client(&temp, "dd if=/dev/zero bs=65536 count=2 2>/dev/null\ncat");
+        let input = "template-input".repeat(16 * 1024);
+        let result = client
+            .run_raw_with_input(
+                ["execute-template"],
+                temp.path(),
+                Some(&input),
+                CommandLimits {
+                    timeout: Duration::from_secs(2),
+                    max_stdout_bytes: 1024 * 1024,
+                    max_stderr_bytes: 64,
+                },
+            )
+            .expect("render without pipe deadlock");
+
+        ensure_complete_success(&result, "chezmoi execute-template").expect("successful rendering");
+        assert!(result.stdout.starts_with(&"\0".repeat(128 * 1024)));
+        assert!(result.stdout.ends_with(&input));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn template_that_exits_without_reading_stdin_reports_failure() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let client = template_test_client(&temp, "printf 'template rejected' >&2\nexit 7");
+        let result = client
+            .run_raw_with_input(
+                ["execute-template"],
+                temp.path(),
+                Some(&"x".repeat(512 * 1024)),
+                CommandLimits {
+                    timeout: Duration::from_secs(1),
+                    max_stdout_bytes: 64,
+                    max_stderr_bytes: 64,
+                },
+            )
+            .expect("no broken-pipe error or leaked child");
+
+        assert_eq!(result.exit_code, 7);
+        assert_eq!(result.stderr, "template rejected");
+        assert!(!result.timed_out);
     }
 
     #[test]

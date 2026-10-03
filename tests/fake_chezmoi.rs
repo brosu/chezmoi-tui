@@ -31,6 +31,7 @@ set -eu
 
 log={log}
 source_dir={source_dir}
+destination=''
 
 # Log argv: one argument per line so boundary safety can be verified.
 printf 'BEGIN\n' >> "$log"
@@ -44,6 +45,7 @@ printf 'END\n' >> "$log"
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --destination)
+      destination="$2"
       shift 2
       ;;
     --source)
@@ -77,6 +79,12 @@ case "$cmd" in
   source-path)
     printf '%s\n' "$source_dir"
     ;;
+  execute-template)
+    cat
+    ;;
+  target-path)
+    printf '%s/.config\n' "$destination"
+    ;;
   diff)
     printf 'diff --git a/.zshrc b/.zshrc\n'
     ;;
@@ -108,7 +116,12 @@ esac
     bin
 }
 
+// Serialize shell fixtures: concurrent fork/exec can temporarily inherit another
+// test's open script writer and cause Linux ETXTBSY even after that writer closes.
+static SHELL_FIXTURES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 struct FakeChezmoi {
+    _guard: std::sync::MutexGuard<'static, ()>,
     _temp: tempfile::TempDir,
     bin: PathBuf,
     home: PathBuf,
@@ -119,6 +132,9 @@ struct FakeChezmoi {
 
 impl FakeChezmoi {
     fn new() -> Self {
+        let guard = SHELL_FIXTURES
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path();
 
@@ -134,6 +150,7 @@ impl FakeChezmoi {
         let bin = write_fake_chezmoi(root, &log, &source);
 
         Self {
+            _guard: guard,
             _temp: temp,
             bin,
             home,
@@ -168,6 +185,229 @@ impl FakeChezmoi {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[test]
+fn shell_client_loads_ignore_template_suffix() {
+    let fake = FakeChezmoi::new();
+    fs::write(
+        fake.source.join(".chezmoiignore.tmpl"),
+        "cache/**\n!cache/keep\n",
+    )
+    .expect("write ignore template");
+
+    assert_eq!(
+        fake.client().ignore_patterns().expect("ignore patterns"),
+        vec!["cache/**", "!cache/keep"]
+    );
+    assert!(
+        fake.logged_args()
+            .iter()
+            .any(|arg| arg == "execute-template")
+    );
+}
+
+#[test]
+fn shell_client_rejects_template_output_above_default_limit() {
+    let fake = FakeChezmoi::new();
+    fs::write(fake.source.join(".chezmoiignore"), "input\n").expect("write ignore");
+    let script = fs::read_to_string(&fake.bin).expect("read fake");
+    fs::write(
+        &fake.bin,
+        script.replace(
+            "    cat\n",
+            "    dd if=/dev/zero bs=1048576 count=5 2>/dev/null\n",
+        ),
+    )
+    .expect("write noisy template renderer");
+
+    let error = fake.client().ignore_patterns().expect_err("output limit");
+    assert!(
+        error
+            .to_string()
+            .contains("output was truncated or limited")
+    );
+}
+
+#[test]
+fn shell_client_loads_nested_ignore_relative_to_decoded_target_directory() {
+    let fake = FakeChezmoi::new();
+    let nested = fake.source.join("private_dot_config");
+    fs::create_dir(&nested).expect("nested source directory");
+    fs::write(
+        nested.join(".chezmoiignore.tmpl"),
+        "  cache/** # comment\n !cache/keep\n# comment\n\n",
+    )
+    .expect("write nested ignore");
+
+    assert_eq!(
+        fake.client().ignore_patterns().expect("nested patterns"),
+        vec![
+            ".config/cache/** # comment",
+            "!.config/cache/keep",
+            "# comment",
+            ""
+        ]
+    );
+    assert!(fake.logged_args().iter().any(|arg| arg == "target-path"));
+}
+
+#[test]
+fn shell_client_uses_authoritative_source_root_over_source_override() {
+    let fake = FakeChezmoi::new();
+    let effective = fake.source.join("actual-root");
+    fs::create_dir(&effective).expect("effective root");
+    fs::write(fake.source.join(".chezmoiroot"), "actual-root\n").expect("root marker");
+    fs::write(fake.source.join(".chezmoiignore"), "wrong-root\n").expect("decoy ignore");
+    fs::write(effective.join(".chezmoiignore"), "actual-root-rule\n").expect("root ignore");
+    write_fake_chezmoi(fake._temp.path(), &fake.log, &effective);
+
+    assert_eq!(
+        fake.client().ignore_patterns().expect("authoritative root"),
+        vec!["actual-root-rule"]
+    );
+    assert!(fake.logged_args().iter().any(|arg| arg == "source-path"));
+}
+
+#[test]
+fn shell_client_renders_ignore_template_instead_of_returning_source() {
+    let fake = FakeChezmoi::new();
+    let input = "{{ if eq .chezmoi.os \"linux\" }}\ncache/**\n{{ end }}\n";
+    fs::write(fake.source.join(".chezmoiignore"), input).expect("write template");
+    let script = fs::read_to_string(&fake.bin).expect("read fake");
+    fs::write(
+        &fake.bin,
+        script.replace(
+            "    cat\n",
+            "    template=$(cat)\n    case \"$template\" in\n      *chezmoi.os*) printf 'cache/**\\n' ;;\n      *) exit 9 ;;\n    esac\n",
+        ),
+    )
+    .expect("configure renderer");
+
+    assert_eq!(
+        fake.client().ignore_patterns().expect("rendered rules"),
+        vec!["cache/**"]
+    );
+}
+
+#[test]
+fn shell_client_without_ignore_files_does_not_run_renderer() {
+    let fake = FakeChezmoi::new();
+    for directory in [
+        ".git",
+        ".chezmoitemplates",
+        ".chezmoidata",
+        ".chezmoiscripts",
+    ] {
+        let directory = fake.source.join(directory);
+        fs::create_dir(&directory).expect("special directory");
+        fs::write(directory.join(".chezmoiignore"), "not-a-rule\n").expect("decoy ignore");
+    }
+    fs::write(fake.source.join(".chezmoiignore.tmpl.bak"), "not-a-rule\n").expect("backup");
+
+    assert!(
+        fake.client()
+            .ignore_patterns()
+            .expect("no ignore files")
+            .is_empty()
+    );
+    assert!(
+        !fake
+            .logged_args()
+            .iter()
+            .any(|arg| arg == "execute-template")
+    );
+}
+
+#[test]
+fn shell_client_loads_both_ignore_names_without_filename_precedence() {
+    let fake = FakeChezmoi::new();
+    fs::write(
+        fake.source.join(".chezmoiignore"),
+        "plain/**\n!shared/keep\n",
+    )
+    .expect("plain ignore");
+    fs::write(
+        fake.source.join(".chezmoiignore.tmpl"),
+        "suffix/**\nshared/**\n",
+    )
+    .expect("suffix ignore");
+
+    assert_eq!(
+        fake.client().ignore_patterns().expect("both files"),
+        vec!["plain/**", "!shared/keep", "suffix/**", "shared/**"]
+    );
+    assert_eq!(
+        fake.logged_args()
+            .iter()
+            .filter(|arg| *arg == "execute-template")
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn shell_client_propagates_template_failure_without_partial_patterns() {
+    let fake = FakeChezmoi::new();
+    fs::write(fake.source.join(".chezmoiignore"), "invalid template\n").expect("template");
+    let script = fs::read_to_string(&fake.bin).expect("read fake");
+    fs::write(
+        &fake.bin,
+        script.replace(
+            "    cat\n",
+            "    printf 'partial-rule\\n'\n    printf 'bad template\\n' >&2\n    exit 7\n",
+        ),
+    )
+    .expect("failing renderer");
+
+    let error = fake
+        .client()
+        .ignore_patterns()
+        .expect_err("renderer failure");
+    assert!(
+        error
+            .to_string()
+            .contains("chezmoi execute-template failed: bad template")
+    );
+}
+
+#[test]
+fn shell_client_rejects_template_stderr_above_default_limit() {
+    let fake = FakeChezmoi::new();
+    fs::write(fake.source.join(".chezmoiignore"), "input\n").expect("write ignore");
+    let script = fs::read_to_string(&fake.bin).expect("read fake");
+    fs::write(
+        &fake.bin,
+        script.replace(
+            "    cat\n",
+            "    dd if=/dev/zero bs=1048576 count=1 >&2 2>/dev/null\n",
+        ),
+    )
+    .expect("noisy stderr renderer");
+
+    let error = fake.client().ignore_patterns().expect_err("stderr limit");
+    assert!(
+        error
+            .to_string()
+            .contains("output was truncated or limited")
+    );
+}
+
+#[test]
+fn shell_client_does_not_descend_source_directory_symlinks() {
+    let fake = FakeChezmoi::new();
+    let stored = fake.source.join(".hidden-store");
+    fs::create_dir(&stored).expect("stored directory");
+    fs::write(stored.join(".chezmoiignore"), "cache/**\n").expect("stored ignore");
+    std::os::unix::fs::symlink(&stored, fake.source.join("dot_config")).expect("source alias");
+
+    // Real chezmoi visits a symlink directory entry but does not recurse into it.
+    assert!(
+        fake.client()
+            .ignore_patterns()
+            .expect("symlinked source")
+            .is_empty()
+    );
+}
 
 #[test]
 fn shell_client_reads_status_from_fake_chezmoi() {

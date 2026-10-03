@@ -30,10 +30,10 @@ pub fn handle_backend_event(
             app.finish_busy_task();
             app.apply_refresh_entries(status, managed, unmanaged, source_dir, source);
             let ignore_error = match ignore_patterns {
-                Ok(patterns) => {
-                    app.set_ignore_patterns(patterns);
-                    None
-                }
+                Ok(patterns) => app
+                    .set_ignore_patterns(patterns)
+                    .err()
+                    .map(|error| format!("{error:#}")),
                 Err(message) => {
                     app.clear_ignore_patterns();
                     Some(message)
@@ -1141,6 +1141,33 @@ mod tests {
     use crate::domain::{ChangeKind, StatusEntry};
     use std::path::PathBuf;
     use tokio::sync::mpsc;
+
+    #[test]
+    fn invalid_ignore_pattern_reports_degraded_refresh() {
+        let mut app = App::new(AppConfig::default());
+        let (task_tx, _task_rx) = mpsc::channel::<BackendTask>(8);
+        app.begin_busy_task();
+
+        handle_backend_event(
+            &mut app,
+            &task_tx,
+            BackendEvent::Refreshed {
+                status: Vec::new(),
+                managed: Vec::new(),
+                unmanaged: Vec::new(),
+                source_dir: None,
+                source: Vec::new(),
+                ignore_patterns: Ok(vec!["[".to_string()]),
+            },
+        )
+        .expect("refresh still completes");
+
+        assert!(!app.is_busy());
+        let notice = app.latest_notice().expect("notice");
+        assert_eq!(notice.tone, NoticeTone::Error);
+        assert!(notice.message.contains(".chezmoiignore"));
+        assert!(notice.message.contains("ignored files"));
+    }
 
     #[test]
     fn busy_stays_true_until_all_in_flight_events_finish() {
